@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 import logging
 
 # ========== CONFIG – ALL FILES IN /tmp ==========
-PARQUET_URL = "https://filetolink2bot-0944e29c8e8c.herokuapp.com/dl/6a81b7429cdecd60f30f3b52"
+PARQUET_URL = "https://justin-jul17x-04-6fce8e1832ea.herokuapp.com//dl/161209?code=22594d6434a0acda13c97c5320b582441f494f2b909f8f1c"
 PARQUET_FILE = "/tmp/users.parquet"          # stored in /tmp
 DB_FILE = "/tmp/cache.duckdb"                # persistent DuckDB cache in /tmp
 
