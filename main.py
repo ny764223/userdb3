@@ -5,16 +5,17 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========== CONFIG ==========
 PARQUET_URL = "https://filetolink2bot-0944e29c8e8c.herokuapp.com/dl/6a81b7429cdecd60f30f3b52"
 PARQUET_FILE = "/tmp/users.parquet"
 DB_FILE = "/tmp/cache.duckdb"
 
-# Download settings – conservative to avoid server overload
-DOWNLOAD_TIMEOUT = 120          # seconds per read attempt
-MAX_RETRIES = 5                 # retries for the whole file
-RETRY_DELAY = 10                # seconds between retries
+# Parallel download settings
+CONNECTIONS = 16
+CHUNK_SIZE = 1024 * 1024
+MAX_RETRIES = 3
 
 # ========== LOGGING ==========
 logging.basicConfig(level=logging.INFO)
@@ -24,46 +25,75 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Parquet Search API")
 con = None
 
-# ========== ROBUST SINGLE‑THREAD DOWNLOAD ==========
-def download_file_single(url, dest):
-    """Download a file with retries, streaming, and progress logging."""
-    if os.path.exists(dest):
-        # Check if existing file is complete (optional: compare size if we knew it)
-        logger.info(f"File already exists: {dest}")
-        return
-
-    for attempt in range(1, MAX_RETRIES + 1):
+# ========== PARALLEL DOWNLOAD ==========
+def download_chunk(url, tmp_path, start, end, retries=MAX_RETRIES):
+    headers = {"User-Agent": "Mozilla/5.0", "Range": f"bytes={start}-{end}"}
+    expected_len = end - start + 1
+    for attempt in range(1, retries + 1):
         try:
-            logger.info(f"Download attempt {attempt}/{MAX_RETRIES}: {url} -> {dest}")
-            headers = {"User-Agent": "Mozilla/5.0"}
-            with requests.get(url, headers=headers, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
+            with requests.get(url, headers=headers, stream=True, timeout=30) as r:
                 r.raise_for_status()
-                total_size = int(r.headers.get("Content-Length", 0))
-                downloaded = 0
-                with open(dest, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024*1024):  # 1 MB
+                with open(tmp_path, "r+b") as f:
+                    f.seek(start)
+                    written = 0
+                    for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
                         if chunk:
                             f.write(chunk)
-                            downloaded += len(chunk)
-                            if total_size:
-                                logger.info(f"Progress: {downloaded / total_size * 100:.1f}%")
-                # verify size
-                if total_size and downloaded != total_size:
-                    raise RuntimeError(f"Size mismatch: {downloaded}/{total_size} bytes")
-                logger.info(f"Download complete: {dest} ({downloaded / 1e9:.2f} GB)")
-                return  # success
+                            written += len(chunk)
+                    if written == expected_len:
+                        return
+                    else:
+                        raise RuntimeError(f"Partial write: {written}/{expected_len}")
         except Exception as e:
-            logger.error(f"Attempt {attempt} failed: {e}")
-            if attempt < MAX_RETRIES:
-                wait = RETRY_DELAY * attempt
-                logger.info(f"Retrying in {wait} seconds...")
-                time.sleep(wait)
-            else:
-                raise RuntimeError(f"All {MAX_RETRIES} attempts failed: {e}")
+            logger.warning(f"Chunk {start}-{end} attempt {attempt} failed: {e}")
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"Failed chunk {start}-{end} after {retries} attempts")
+
+def download_file_parallel(url, dest):
+    head = requests.head(url, headers={"User-Agent": "Mozilla/5.0"})
+    head.raise_for_status()
+    total_size = int(head.headers.get("Content-Length", 0))
+    accepts_ranges = head.headers.get("Accept-Ranges", "").lower() == "bytes"
+
+    if os.path.exists(dest) and os.path.getsize(dest) == total_size:
+        logger.info(f"File already exists and is complete: {dest}")
+        return
+
+    logger.info(f"Downloading {url} -> {dest} ({total_size / 1e9:.2f} GB) with {CONNECTIONS} connections...")
+    tmp_path = dest + ".tmp"
+    with open(tmp_path, "wb") as f:
+        f.truncate(total_size)
+
+    if accepts_ranges and total_size > 0:
+        chunk_size = total_size // CONNECTIONS
+        futures = []
+        with ThreadPoolExecutor(max_workers=CONNECTIONS) as executor:
+            for i in range(CONNECTIONS):
+                start = i * chunk_size
+                end = total_size - 1 if i == CONNECTIONS - 1 else (start + chunk_size - 1)
+                futures.append(executor.submit(download_chunk, url, tmp_path, start, end))
+            for f in as_completed(futures):
+                f.result()
+    else:
+        logger.warning("Server does not support Range, falling back to single-thread download.")
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                    if chunk:
+                        f.write(chunk)
+
+    downloaded = os.path.getsize(tmp_path)
+    if downloaded == total_size:
+        os.rename(tmp_path, dest)
+        logger.info(f"Download complete and verified: {dest}")
+    else:
+        os.remove(tmp_path)
+        raise RuntimeError(f"Size mismatch: {downloaded}/{total_size} bytes")
 
 def ensure_file_downloaded():
     if not os.path.exists(PARQUET_FILE):
-        download_file_single(PARQUET_URL, PARQUET_FILE)
+        download_file_parallel(PARQUET_URL, PARQUET_FILE)
 
 def get_connection():
     global con
@@ -92,6 +122,7 @@ def health():
 def search_mobile(mobile: str = Query(..., description="Mobile number to search")):
     try:
         db = get_connection()
+        # Your exact query – specific columns, LIMIT 20
         query = """
             SELECT
                 mobile,
