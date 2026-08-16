@@ -7,7 +7,7 @@ import logging
 import time
 
 # ========== CONFIG ==========
-PARQUET_URL = "https://filetolink2bot-0944e29c8e8c.herokuapp.com/dl/6a81a7b49cdecd60f30f3a30"
+PARQUET_URL = "https://filetolink2bot-0944e29c8e8c.herokuapp.com/dl/6a81b7429cdecd60f30f3b52"
 PARQUET_FILE = "/tmp/users.parquet"
 DB_FILE = "/tmp/cache.duckdb"
 
